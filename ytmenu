@@ -1,0 +1,211 @@
+#!/bin/python3
+""" Simple interface for playing YouTube videos, mixes and streams in MPD """
+import os
+from subprocess import PIPE, Popen
+import getpass
+
+import pafy
+from mpd import MPDClient
+from appdirs import user_data_dir
+
+API_KEY = '{YOUR_API_KEY_HERE}'
+pafy.set_api_key(API_KEY)
+
+def find_field_in_json(fields, json):
+    """ Return value of field from json which matches one of the given paths """
+    for field in fields:
+        node = json
+        for part in field.split("/"):
+            if node and isinstance(node, dict):
+                node = node.get(part)
+        if node:
+            # Make sure that what we are returning is a string
+            if isinstance(node, str):
+                return node
+    return ""
+
+def get_track_id_from_json(item):
+    """ Try to extract a video Id from a pafy query response """
+    fields = [
+        "contentDetails/videoId",
+        "snippet/resourceId/videoId",
+        "id/videoId",
+        "id",
+    ]
+    return find_field_in_json(fields, item)
+
+def get_title_from_json(item):
+    """ Try to extract a video title from pafy query response """
+    fields = [
+        'snippet/title',
+        'contentDetails/title',
+        'title'
+    ]
+    return find_field_in_json(fields, item)
+
+def dmenu(options, default=0, dmenu_extra_options='', allow_any=False):
+    """ Open dmenu with the list of options, and return index of selected.
+        Repeats until valid options is selected.
+    """
+    while True:
+        proc = Popen(['dmenu ' + dmenu_extra_options], shell=True, stdin=PIPE, stdout=PIPE)
+        out, _ = proc.communicate('\n'.join(options).encode('utf-8'))
+        out = out.decode('utf-8').strip('\n')
+        if allow_any:
+            return out
+        if out == '':
+            return default
+        if out in options:
+            return options.index(out)
+
+def search_videos(search_term, extra_params={}):
+    """ Search for the given phrase and return 5 tuples of video ids and titles """
+    query_string = {
+        "q": search_term,
+        "maxResults": 10,
+        "safeSearch": "none",
+        "order": "relevance",
+        "part": "id,snippet",
+        "type": "video",
+        "key": API_KEY,
+        "videoCategoryId": 10,  # search music
+    }
+    query_string.update(extra_params)
+
+    data = pafy.call_gdata('search', query_string)
+    items = data.get('items')
+    vids = [(get_track_id_from_json(item), get_title_from_json(item)) for item in items]
+    vids = [vid for vid in vids if '' not in vid]
+
+    return vids
+
+def select_single(videos):
+    """ Present to the user the videos, and return only the selected one """
+    options = [vid_title for _, vid_title in videos]
+    options.append('Cancel')
+    cancel_idx = len(options) - 1
+    ans = dmenu(options, default=cancel_idx, dmenu_extra_options='-l 5')
+    if ans == cancel_idx:
+        return None
+    selected_vid_id, _ = videos[ans]
+    selected_vid = pafy.new(selected_vid_id)
+    return [selected_vid]
+
+def select_mix(videos):
+    """ Present to the user the videos wich have mixes, and return all the videos in the mix """
+    selected_vid = None
+    for vid_id, _ in videos:
+        try:
+            video = pafy.new(vid_id)
+            mix = video.mix
+            if len(mix) > 0:
+                ans = dmenu([f'Play Mix {video.title}', 'Next', 'Cancel'], default=2)
+                if ans == 1:
+                    continue
+                if ans == 0:
+                    selected_vid = video
+                break
+        except IndexError:
+            pass
+
+    if selected_vid is None:
+        return None
+
+    return [selected_vid, *selected_vid.mix]
+
+def get_videos_from_history_entry(hist_ent):
+    """ Return a list of pafy video objects from a history entry """
+    vid_id, mode = hist_ent
+    video = pafy.new(vid_id)
+    if mode == 'mix':
+        return [video, *video.mix]
+    return [video]
+
+def get_url(vid):
+    """ Try to get a direct url from a pafy video object """
+    try:
+        return vid.getbestaudio().url
+    except AttributeError:
+        return vid.getbest().url
+
+def main():
+    """ Main """
+    datadir = user_data_dir('ytmenu', getpass.getuser())
+    if not os.path.exists(datadir):
+        os.mkdir(datadir)
+
+    main_menu_options = [
+        'Search new mix',
+        'Search new single video',
+        'Search new live stream'
+    ]
+
+    history_ids = []
+    hist_file_path = os.path.join(datadir, 'history')
+    if os.path.exists(hist_file_path):
+        with open(hist_file_path) as hist_file:
+            for line in hist_file.readlines()[::-1]:
+                parts = line.strip('\n').split()
+                mode, vid_id = parts[0], parts[1]
+                title = ' '.join(parts[2:])
+                history_ids.append((vid_id, mode))
+                main_menu_options.append(f'Play {mode} - "{title}"')
+
+    ans = dmenu(main_menu_options, dmenu_extra_options='-l 5', default=-1)
+    if ans == -1:
+        return
+
+    if ans in range(3):
+        term = dmenu([''], dmenu_extra_options='-p "Search:"', allow_any=True)
+
+        if term == '':
+            return
+
+        if ans == 0:
+            mode = 'mix'
+            videos_to_play = select_mix(search_videos(term))
+        elif ans == 1:
+            mode = 'single'
+            videos_to_play = select_single(search_videos(term))
+        elif ans == 2:
+            mode = 'live'
+            resutls = search_videos(term + ' 24/7', {'eventType': 'live'})
+            videos_to_play = select_single(resutls)
+
+        if videos_to_play is None:
+            return
+
+        with open(hist_file_path, 'a') as hist_file:
+            tosave = videos_to_play[0]
+            hist_file.write(f'{mode} {tosave.videoid} {tosave.title}\n')
+    elif ans - 3 in range(len(history_ids)):
+        videos_to_play = get_videos_from_history_entry(history_ids[ans - 3])
+    else:
+        return
+
+    client = MPDClient()
+    client.connect("localhost", 6600)
+
+    # Start playing the first song asap
+    first_vid = videos_to_play.pop(0)
+    client.command_list_ok_begin()
+    client.clear()
+    client.add(get_url(first_vid))
+    client.play()
+    client.command_list_end()
+
+    songid = int(client.status()['songid'])
+    client.addtagid(songid, 'title', first_vid.title)
+
+    client.command_list_ok_begin()
+    for vid in videos_to_play:
+        client.add(get_url(vid))
+        songid += 1
+        client.addtagid(songid, 'title', vid.title)
+    client.command_list_end()
+
+    client.close()
+    client.disconnect()
+
+if __name__ == '__main__':
+    main()
